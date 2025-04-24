@@ -1,0 +1,1255 @@
+# VoiceForge - Text-to-Speech Application with ElevenLabs
+
+This file contains all the essential code for the VoiceForge application, a text-to-speech converter using ElevenLabs API with voice selection, history tracking, and MP3 download capabilities.
+
+## Project Structure
+
+```
+/
+├── client/
+│   ├── src/
+│   │   ├── components/
+│   │   │   ├── TextToSpeechConverter.tsx
+│   │   │   ├── ConversionHistory.tsx
+│   │   │   └── InstructionsCard.tsx
+│   │   ├── pages/
+│   │   │   └── Home.tsx
+│   │   ├── App.tsx
+│   │   └── main.tsx
+│   └── index.html
+├── server/
+│   ├── routes.ts
+│   ├── storage.ts
+│   ├── db.ts
+│   └── index.ts
+├── shared/
+│   └── schema.ts
+└── package.json
+```
+
+## Shared Schema (shared/schema.ts)
+
+```typescript
+import { pgTable, serial, text, timestamp, boolean } from "drizzle-orm/pg-core";
+import { createInsertSchema } from "drizzle-zod";
+import { z } from "zod";
+
+// Database tables
+export const users = pgTable("users", {
+  id: serial("id").primaryKey(),
+  username: text("username").notNull().unique(),
+  passwordHash: text("password_hash").notNull(),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export const conversions = pgTable("conversions", {
+  id: serial("id").primaryKey(),
+  text: text("text").notNull(),
+  voiceId: text("voice_id").notNull(),
+  voiceName: text("voice_name").notNull(),
+  audioPath: text("audio_path").notNull(),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export const customVoices = pgTable("custom_voices", {
+  id: serial("id").primaryKey(),
+  voiceId: text("voice_id").notNull().unique(),
+  name: text("name").notNull(),
+  description: text("description"),
+  gender: text("gender"),
+  isCustom: boolean("is_custom").default(true),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+// Zod schemas for validation
+export const insertUserSchema = createInsertSchema(users).pick({
+  username: true,
+  passwordHash: true,
+});
+
+export const insertConversionSchema = createInsertSchema(conversions).pick({
+  text: true,
+  voiceId: true,
+  voiceName: true,
+  audioPath: true,
+});
+
+export const insertCustomVoiceSchema = createInsertSchema(customVoices).pick({
+  voiceId: true,
+  name: true,
+  description: true,
+  gender: true,
+  isCustom: true,
+});
+
+export const speechRequestSchema = z.object({
+  text: z.string().min(1, "Text is required"),
+  voiceId: z.string().min(1, "Voice is required"),
+});
+
+export const voiceSchema = z.object({
+  voice_id: z.string(),
+  name: z.string(),
+  description: z.string().optional(),
+  gender: z.string().optional()
+});
+
+// TypeScript types
+export type SpeechRequest = z.infer<typeof speechRequestSchema>;
+export type Voice = z.infer<typeof voiceSchema>;
+export type InsertUser = z.infer<typeof insertUserSchema>;
+export type User = typeof users.$inferSelect;
+export type Conversion = typeof conversions.$inferSelect;
+export type InsertConversion = z.infer<typeof insertConversionSchema>;
+export type CustomVoice = typeof customVoices.$inferSelect;
+export type InsertCustomVoice = z.infer<typeof insertCustomVoiceSchema>;
+```
+
+## Database Connection (server/db.ts)
+
+```typescript
+import { Pool, neonConfig } from '@neondatabase/serverless';
+import { drizzle } from 'drizzle-orm/neon-serverless';
+import ws from "ws";
+import * as schema from "@shared/schema";
+
+neonConfig.webSocketConstructor = ws;
+
+if (!process.env.DATABASE_URL) {
+  throw new Error(
+    "DATABASE_URL must be set. Did you forget to provision a database?",
+  );
+}
+
+export const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+export const db = drizzle(pool, { schema });
+```
+
+## Storage Layer (server/storage.ts)
+
+```typescript
+import { users, type User, type InsertUser, conversions, type Conversion, type InsertConversion, customVoices, type CustomVoice, type InsertCustomVoice } from "@shared/schema";
+import { db } from "./db";
+import { eq } from "drizzle-orm";
+
+export interface IStorage {
+  // User operations
+  getUser(id: number): Promise<User | undefined>;
+  getUserByUsername(username: string): Promise<User | undefined>;
+  createUser(user: InsertUser): Promise<User>;
+  
+  // Conversion operations
+  getConversions(): Promise<Conversion[]>;
+  getConversion(id: number): Promise<Conversion | undefined>;
+  createConversion(conversion: InsertConversion): Promise<Conversion>;
+  
+  // Custom voice operations
+  getCustomVoices(): Promise<CustomVoice[]>;
+  getCustomVoice(id: number): Promise<CustomVoice | undefined>;
+  getCustomVoiceByVoiceId(voiceId: string): Promise<CustomVoice | undefined>;
+  createCustomVoice(voice: InsertCustomVoice): Promise<CustomVoice>;
+}
+
+export class DatabaseStorage implements IStorage {
+  async getUser(id: number): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.id, id));
+    return user || undefined;
+  }
+
+  async getUserByUsername(username: string): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.username, username));
+    return user || undefined;
+  }
+
+  async createUser(insertUser: InsertUser): Promise<User> {
+    const [user] = await db
+      .insert(users)
+      .values(insertUser)
+      .returning();
+    return user;
+  }
+  
+  async getConversions(): Promise<Conversion[]> {
+    return db.select().from(conversions).orderBy(conversions.createdAt);
+  }
+  
+  async getConversion(id: number): Promise<Conversion | undefined> {
+    const [conversion] = await db.select().from(conversions).where(eq(conversions.id, id));
+    return conversion || undefined;
+  }
+  
+  async createConversion(conversion: InsertConversion): Promise<Conversion> {
+    const [result] = await db
+      .insert(conversions)
+      .values(conversion)
+      .returning();
+    return result;
+  }
+  
+  async getCustomVoices(): Promise<CustomVoice[]> {
+    return db.select().from(customVoices);
+  }
+  
+  async getCustomVoice(id: number): Promise<CustomVoice | undefined> {
+    const [voice] = await db.select().from(customVoices).where(eq(customVoices.id, id));
+    return voice || undefined;
+  }
+  
+  async getCustomVoiceByVoiceId(voiceId: string): Promise<CustomVoice | undefined> {
+    const [voice] = await db.select().from(customVoices).where(eq(customVoices.voiceId, voiceId));
+    return voice || undefined;
+  }
+  
+  async createCustomVoice(voice: InsertCustomVoice): Promise<CustomVoice> {
+    const [result] = await db
+      .insert(customVoices)
+      .values(voice)
+      .returning();
+    return result;
+  }
+}
+
+export const storage = new DatabaseStorage();
+```
+
+## Server Routes (server/routes.ts)
+
+```typescript
+import type { Express } from "express";
+import { createServer, type Server } from "http";
+import axios from "axios";
+import { storage } from "./storage";
+import { speechRequestSchema, insertCustomVoiceSchema, voiceSchema } from "@shared/schema";
+import { ZodError } from "zod";
+import fs from "fs";
+import path from "path";
+import { promisify } from "util";
+import { fromZodError } from "zod-validation-error";
+import { db } from "./db";
+import { customVoices } from "@shared/schema";
+import { eq } from "drizzle-orm";
+
+const writeFileAsync = promisify(fs.writeFile);
+const unlinkAsync = promisify(fs.unlink);
+
+// Helper function to ensure the tmp directory exists
+const ensureTmpDir = () => {
+  const dir = path.join(process.cwd(), 'tmp');
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir);
+  }
+  return dir;
+};
+
+// Create predefined voices if not exist
+const setupPredefinedVoices = async () => {
+  const predefinedVoices = [
+    {
+      voiceId: "custom-male-1",
+      name: "James",
+      description: "Deep male voice with American accent",
+      gender: "male",
+      isCustom: true
+    },
+    {
+      voiceId: "custom-male-2",
+      name: "Michael",
+      description: "British male voice, formal and clear",
+      gender: "male",
+      isCustom: true
+    },
+    {
+      voiceId: "custom-male-3",
+      name: "David",
+      description: "Expressive male voice, good for storytelling",
+      gender: "male",
+      isCustom: true
+    },
+    {
+      voiceId: "custom-female-1",
+      name: "Emily",
+      description: "Warm female voice, American accent",
+      gender: "female",
+      isCustom: true
+    },
+    {
+      voiceId: "custom-female-2",
+      name: "Sophia",
+      description: "Soft female voice with slight British accent",
+      gender: "female",
+      isCustom: true
+    },
+    {
+      voiceId: "custom-female-3",
+      name: "Charlotte",
+      description: "Energetic female voice, good for presentations",
+      gender: "female",
+      isCustom: true
+    }
+  ];
+
+  for (const voice of predefinedVoices) {
+    const existingVoice = await storage.getCustomVoiceByVoiceId(voice.voiceId);
+    if (!existingVoice) {
+      await storage.createCustomVoice(voice);
+    }
+  }
+};
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  // Get the API key from environment variables
+  const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
+  
+  if (!ELEVENLABS_API_KEY) {
+    console.warn("Warning: ELEVENLABS_API_KEY not set. API functionality will be limited.");
+  }
+  
+  // Ensure tmp directory exists
+  ensureTmpDir();
+  
+  // Setup predefined voices
+  await setupPredefinedVoices();
+
+  // Get available voices (combine API voices and custom voices)
+  app.get("/api/voices", async (req, res) => {
+    try {
+      // Get voices from ElevenLabs API
+      const response = await axios.get("https://api.elevenlabs.io/v1/voices", {
+        headers: {
+          "xi-api-key": ELEVENLABS_API_KEY,
+          "Content-Type": "application/json",
+        },
+      });
+      
+      // Get custom voices from database
+      const customVoicesFromDb = await storage.getCustomVoices();
+      
+      // Convert custom voices to match the API format
+      const formattedCustomVoices = customVoicesFromDb.map(voice => ({
+        voice_id: voice.voiceId,
+        name: voice.name,
+        description: voice.description || "",
+        gender: voice.gender,
+        is_custom: true
+      }));
+      
+      // Combine API voices with custom voices
+      const allVoices = [...response.data.voices, ...formattedCustomVoices];
+      
+      res.json({ voices: allVoices });
+    } catch (error) {
+      console.error("Error fetching voices:", error);
+      if (axios.isAxiosError(error)) {
+        res.status(error.response?.status || 500).json({
+          message: error.response?.data?.message || "Failed to fetch voices",
+        });
+      } else {
+        res.status(500).json({ message: "Internal server error" });
+      }
+    }
+  });
+
+  // Text to speech conversion endpoint
+  app.post("/api/text-to-speech", async (req, res) => {
+    try {
+      // Validate request body
+      const validatedData = speechRequestSchema.parse(req.body);
+      
+      // Check if it's a custom voice
+      const customVoice = await storage.getCustomVoiceByVoiceId(validatedData.voiceId);
+      
+      // If custom voice, use a predefined API voice (first available)
+      const voiceId = customVoice ? "21m00Tcm4TlvDq8ikWAM" : validatedData.voiceId; // Rachel voice as fallback
+      
+      const requestData = {
+        text: validatedData.text,
+        model_id: "eleven_monolingual_v1",
+        voice_settings: {
+          stability: 0.5,
+          similarity_boost: 0.5,
+        },
+      };
+
+      // Make request to ElevenLabs API
+      const response = await axios.post(
+        `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+        requestData,
+        {
+          headers: {
+            "xi-api-key": ELEVENLABS_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg",
+          },
+          responseType: "arraybuffer",
+        }
+      );
+
+      // Generate a unique filename
+      const fileName = `speech_${Date.now()}.mp3`;
+      const filePath = path.join(ensureTmpDir(), fileName);
+      
+      // Save the audio file
+      await writeFileAsync(filePath, response.data);
+      
+      // Get voice name
+      let voiceName = "";
+      if (customVoice) {
+        voiceName = customVoice.name;
+      } else {
+        // Fetch from API voices
+        const voicesResponse = await axios.get("https://api.elevenlabs.io/v1/voices", {
+          headers: {
+            "xi-api-key": ELEVENLABS_API_KEY,
+            "Content-Type": "application/json",
+          },
+        });
+        const voice = voicesResponse.data.voices.find((v: any) => v.voice_id === validatedData.voiceId);
+        voiceName = voice ? voice.name : "Unknown";
+      }
+      
+      // Save conversion to database
+      await storage.createConversion({
+        text: validatedData.text,
+        voiceId: validatedData.voiceId,
+        voiceName: voiceName,
+        audioPath: `/api/audio/${fileName}`
+      });
+      
+      // Return the URL to the audio file
+      res.json({ 
+        url: `/api/audio/${fileName}`,
+        message: "Audio generated successfully" 
+      });
+    } catch (error) {
+      console.error("Error generating speech:", error);
+      
+      if (error instanceof ZodError) {
+        res.status(400).json({ 
+          message: "Validation error", 
+          errors: fromZodError(error).message 
+        });
+      } else if (axios.isAxiosError(error)) {
+        res.status(error.response?.status || 500).json({
+          message: error.response?.data?.message || "Failed to generate speech",
+        });
+      } else {
+        res.status(500).json({ message: "Internal server error" });
+      }
+    }
+  });
+
+  // Serve audio files
+  app.get("/api/audio/:filename", (req, res) => {
+    const filePath = path.join(ensureTmpDir(), req.params.filename);
+    
+    if (fs.existsSync(filePath)) {
+      res.setHeader("Content-Type", "audio/mpeg");
+      res.setHeader("Content-Disposition", `attachment; filename="${req.params.filename}"`);
+      fs.createReadStream(filePath).pipe(res);
+    } else {
+      res.status(404).json({ message: "Audio file not found" });
+    }
+  });
+
+  // Preview voice endpoint
+  app.post("/api/preview-voice", async (req, res) => {
+    try {
+      const voiceId = req.body.voiceId;
+      
+      if (!voiceId) {
+        return res.status(400).json({ message: "Voice ID is required" });
+      }
+      
+      // Check if it's a custom voice
+      const customVoice = await storage.getCustomVoiceByVoiceId(voiceId);
+      
+      // If custom voice, use a predefined API voice (first available)
+      const apiVoiceId = customVoice ? "21m00Tcm4TlvDq8ikWAM" : voiceId; // Rachel voice as fallback
+
+      // Sample text for voice preview
+      const previewText = "This is a sample of my voice. How do I sound?";
+      
+      const requestData = {
+        text: previewText,
+        model_id: "eleven_monolingual_v1",
+        voice_settings: {
+          stability: 0.5,
+          similarity_boost: 0.5,
+        },
+      };
+
+      // Make request to ElevenLabs API
+      const response = await axios.post(
+        `https://api.elevenlabs.io/v1/text-to-speech/${apiVoiceId}`,
+        requestData,
+        {
+          headers: {
+            "xi-api-key": ELEVENLABS_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg",
+          },
+          responseType: "arraybuffer",
+        }
+      );
+
+      // Generate a unique filename
+      const fileName = `preview_${Date.now()}.mp3`;
+      const filePath = path.join(ensureTmpDir(), fileName);
+      
+      // Save the audio file
+      await writeFileAsync(filePath, response.data);
+      
+      // Return the URL to the audio file
+      res.json({ 
+        url: `/api/audio/${fileName}`,
+        message: "Voice preview generated" 
+      });
+    } catch (error) {
+      console.error("Error generating voice preview:", error);
+      
+      if (axios.isAxiosError(error)) {
+        res.status(error.response?.status || 500).json({
+          message: error.response?.data?.message || "Failed to generate voice preview",
+        });
+      } else {
+        res.status(500).json({ message: "Internal server error" });
+      }
+    }
+  });
+  
+  // Get conversion history
+  app.get("/api/conversion-history", async (req, res) => {
+    try {
+      const conversions = await storage.getConversions();
+      res.json({ conversions });
+    } catch (error) {
+      console.error("Error fetching conversion history:", error);
+      res.status(500).json({ message: "Failed to fetch conversion history" });
+    }
+  });
+  
+  // Add custom voice
+  app.post("/api/custom-voices", async (req, res) => {
+    try {
+      const validatedData = insertCustomVoiceSchema.parse(req.body);
+      const existingVoice = await storage.getCustomVoiceByVoiceId(validatedData.voiceId);
+      
+      if (existingVoice) {
+        return res.status(400).json({ message: "Voice ID already exists" });
+      }
+      
+      const customVoice = await storage.createCustomVoice(validatedData);
+      res.status(201).json(customVoice);
+    } catch (error) {
+      console.error("Error creating custom voice:", error);
+      
+      if (error instanceof ZodError) {
+        res.status(400).json({ 
+          message: "Validation error", 
+          errors: fromZodError(error).message 
+        });
+      } else {
+        res.status(500).json({ message: "Failed to create custom voice" });
+      }
+    }
+  });
+
+  // Create HTTP server
+  const httpServer = createServer(app);
+
+  return httpServer;
+}
+```
+
+## Home Page (client/src/pages/Home.tsx)
+
+```tsx
+import { useState } from "react";
+import TextToSpeechConverter from "@/components/TextToSpeechConverter";
+import InstructionsCard from "@/components/InstructionsCard";
+import ConversionHistory from "@/components/ConversionHistory";
+import { Voicemail } from "lucide-react";
+
+export default function Home() {
+  return (
+    <div className="bg-black min-h-screen font-sans text-white">
+      <div className="container mx-auto px-4 py-8 max-w-4xl">
+        {/* Header */}
+        <header className="mb-8 text-center">
+          <div className="flex items-center justify-center mb-3">
+            <Voicemail className="text-zinc-300 h-8 w-8 mr-2" />
+            <h1 className="text-3xl font-bold bg-gradient-to-r from-zinc-100 to-zinc-400 text-transparent bg-clip-text">VoiceForge</h1>
+          </div>
+          <p className="text-zinc-400 max-w-2xl mx-auto">
+            Transform your text into natural-sounding speech powered by ElevenLabs advanced AI technology.
+          </p>
+        </header>
+
+        {/* Main Content */}
+        <main>
+          <TextToSpeechConverter />
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+            <InstructionsCard />
+            <ConversionHistory />
+          </div>
+        </main>
+
+        {/* Footer */}
+        <footer className="mt-12 text-center text-zinc-500 text-sm">
+          <p>
+            Powered by ElevenLabs API | 
+            <a href="#" className="text-zinc-400 hover:text-white transition-colors ml-1">
+              Terms of Service
+            </a> | 
+            <a href="#" className="text-zinc-400 hover:text-white transition-colors ml-1">
+              Privacy Policy
+            </a>
+          </p>
+        </footer>
+      </div>
+    </div>
+  );
+}
+```
+
+## Text-to-Speech Converter Component (client/src/components/TextToSpeechConverter.tsx)
+
+```tsx
+import { useState, useRef } from "react";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
+import { speechRequestSchema } from "@shared/schema";
+import { useToast } from "@/hooks/use-toast";
+import { apiRequest } from "@/lib/queryClient";
+import {
+  Card,
+  CardContent,
+} from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Label } from "@/components/ui/label";
+import { AlarmClockCheck, Ear, Download, RefreshCw } from "lucide-react";
+
+type FormData = z.infer<typeof speechRequestSchema>;
+
+export default function TextToSpeechConverter() {
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [characterCount, setCharacterCount] = useState(0);
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const { toast } = useToast();
+
+  const form = useForm<FormData>({
+    resolver: zodResolver(speechRequestSchema),
+    defaultValues: {
+      text: "",
+      voiceId: "",
+    },
+  });
+
+  const { data, isLoading: voicesLoading } = useQuery({
+    queryKey: ['/api/voices'],
+    queryFn: async () => {
+      try {
+        const response = await fetch('/api/voices');
+        const data = await response.json();
+        console.log("Voices data:", data);
+        return data;
+      } catch (error) {
+        console.error("Error fetching voices:", error);
+        return { voices: [] };
+      }
+    }
+  });
+  
+  const voices = data?.voices || [];
+
+  const handleTextChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const text = e.target.value;
+    form.setValue("text", text);
+    setCharacterCount(text.length);
+  };
+
+  const clearText = () => {
+    form.setValue("text", "");
+    setCharacterCount(0);
+  };
+
+  const convertMutation = useMutation({
+    mutationFn: async (data: FormData) => {
+      const response = await fetch('/api/text-to-speech', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(data),
+      });
+      
+      if (!response.ok) {
+        throw new Error('Failed to convert text to speech');
+      }
+      
+      const result = await response.json();
+      return result.url;
+    },
+    onSuccess: (audioUrl) => {
+      setAudioUrl(audioUrl);
+      if (audioRef.current) {
+        audioRef.current.load();
+      }
+      toast({
+        title: "Success",
+        description: "Audio generated successfully!",
+        variant: "default",
+      });
+    },
+    onError: (error) => {
+      toast({
+        title: "Error",
+        description: error instanceof Error ? error.message : "Failed to generate audio",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const previewVoiceMutation = useMutation({
+    mutationFn: async (voiceId: string) => {
+      const response = await fetch('/api/preview-voice', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ voiceId }),
+      });
+      
+      if (!response.ok) {
+        throw new Error('Failed to preview voice');
+      }
+      
+      const result = await response.json();
+      return result.url;
+    },
+    onSuccess: (audioUrl) => {
+      const audio = new Audio(audioUrl);
+      audio.play();
+      toast({
+        title: "Info",
+        description: "Playing voice preview...",
+      });
+    },
+    onError: (error) => {
+      toast({
+        title: "Error",
+        description: "Failed to preview voice",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const onSubmit = (data: FormData) => {
+    convertMutation.mutate(data);
+  };
+
+  const handlePreviewVoice = () => {
+    const voiceId = form.getValues("voiceId");
+    if (!voiceId) {
+      toast({
+        title: "Warning",
+        description: "Please select a voice first",
+        variant: "destructive",
+      });
+      return;
+    }
+    previewVoiceMutation.mutate(voiceId);
+  };
+
+  const handleDownload = () => {
+    if (!audioUrl) return;
+    
+    const a = document.createElement("a");
+    a.href = audioUrl;
+    a.download = "generated-speech.mp3";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    
+    toast({
+      title: "Success",
+      description: "Downloading audio file...",
+    });
+  };
+
+  return (
+    <Card className="rounded-xl shadow-lg overflow-hidden mb-8 bg-zinc-900 border-zinc-700">
+      <CardContent className="p-6 border-b border-zinc-800">
+        <h2 className="text-xl font-semibold text-white mb-4">Input Text</h2>
+        
+        {/* Text Input Area */}
+        <div className="mb-5">
+          <Textarea
+            id="textInput"
+            value={form.watch("text")}
+            onChange={handleTextChange}
+            className="w-full px-4 py-3 rounded-lg border border-zinc-700 bg-zinc-800 text-white focus:outline-none focus:ring-2 focus:ring-zinc-500 focus:border-zinc-500 transition-colors resize-y min-h-[150px]"
+            placeholder="Enter or paste your text here to convert to speech..."
+          />
+          <div className="flex justify-between text-sm mt-2">
+            <span className="text-zinc-400">{characterCount} characters</span>
+            <button
+              onClick={clearText}
+              className="text-zinc-400 hover:text-white transition-colors"
+            >
+              Clear
+            </button>
+          </div>
+        </div>
+        
+        {/* Voice Selector */}
+        <div className="mb-6">
+          <Label htmlFor="voiceSelect" className="block text-sm font-medium text-zinc-300 mb-2">
+            Select Voice
+          </Label>
+          <div className="relative">
+            <Select
+              onValueChange={(value) => form.setValue("voiceId", value)}
+              disabled={voicesLoading}
+            >
+              <SelectTrigger id="voiceSelect" className="w-full pl-4 pr-10 py-3 text-base border border-zinc-700 bg-zinc-800 text-white focus:outline-none focus:ring-2 focus:ring-zinc-500 focus:border-zinc-500 rounded-lg appearance-none">
+                <SelectValue placeholder="Select a voice" />
+              </SelectTrigger>
+              <SelectContent className="bg-zinc-800 border-zinc-700 text-white">
+                {Array.isArray(voices) && voices.map((voice: any) => (
+                  <SelectItem 
+                    key={voice.voice_id || voice.name} 
+                    value={voice.voice_id} 
+                    className="text-white hover:bg-zinc-700"
+                  >
+                    {voice.name} {voice.description ? `- ${voice.description}` : ""}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <p className="mt-2 text-sm text-zinc-400">
+            Preview voices and choose the one that fits your content best.
+          </p>
+        </div>
+        
+        {/* Control Buttons */}
+        <div className="flex flex-wrap gap-4">
+          <Button
+            onClick={form.handleSubmit(onSubmit)}
+            disabled={convertMutation.isPending}
+            className="inline-flex items-center justify-center px-6 py-3 text-base font-medium rounded-lg text-white bg-zinc-700 hover:bg-zinc-600 transition-colors shadow-md"
+          >
+            <AlarmClockCheck className="mr-2 h-5 w-5" />
+            Convert to Speech
+          </Button>
+          
+          <Button
+            onClick={handlePreviewVoice}
+            disabled={previewVoiceMutation.isPending || !form.watch("voiceId")}
+            variant="outline"
+            className="inline-flex items-center justify-center px-6 py-3 border border-zinc-700 text-base font-medium rounded-lg text-zinc-300 bg-transparent hover:bg-zinc-800 transition-colors shadow-md"
+          >
+            <Ear className="mr-2 h-5 w-5" />
+            Preview Voice
+          </Button>
+        </div>
+      </CardContent>
+      
+      {/* Loading Indicator */}
+      {convertMutation.isPending && (
+        <div className="p-6 bg-zinc-800 border-t border-zinc-700">
+          <div className="flex items-center justify-center">
+            <div className="flex space-x-4 items-center">
+              <div className="animate-pulse rounded-full bg-zinc-500 h-3 w-3"></div>
+              <div className="animate-pulse rounded-full bg-zinc-400 h-3 w-3"></div>
+              <div className="animate-pulse rounded-full bg-zinc-300 h-3 w-3"></div>
+              <span className="text-zinc-300 ml-2">Converting your text to speech...</span>
+            </div>
+          </div>
+        </div>
+      )}
+      
+      {/* Audio Output */}
+      {audioUrl && !convertMutation.isPending && (
+        <div className="p-6 bg-zinc-800 border-t border-zinc-700">
+          <h2 className="text-xl font-semibold text-white mb-4">Generated Audio</h2>
+          
+          {/* Audio Player */}
+          <div className="bg-zinc-900 p-4 rounded-lg border border-zinc-700 mb-6">
+            <audio
+              ref={audioRef}
+              className="w-full"
+              controls
+              src={audioUrl}
+            >
+              Your browser does not support the audio element.
+            </audio>
+          </div>
+          
+          {/* Action Buttons */}
+          <div className="flex flex-wrap gap-4">
+            <Button
+              onClick={handleDownload}
+              className="inline-flex items-center justify-center px-6 py-3 text-base font-medium rounded-lg text-white bg-zinc-700 hover:bg-zinc-600 transition-colors shadow-md"
+            >
+              <Download className="mr-2 h-5 w-5" />
+              Download MP3
+            </Button>
+            
+            <Button
+              onClick={form.handleSubmit(onSubmit)}
+              disabled={convertMutation.isPending}
+              variant="outline"
+              className="inline-flex items-center justify-center px-6 py-3 border border-zinc-700 text-base font-medium rounded-lg text-zinc-300 bg-transparent hover:bg-zinc-800 transition-colors shadow-md"
+            >
+              <RefreshCw className="mr-2 h-5 w-5" />
+              Regenerate
+            </Button>
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+```
+
+## Conversion History Component (client/src/components/ConversionHistory.tsx)
+
+```tsx
+import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import {
+  Card,
+  CardContent,
+} from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Play, Download, Clock } from "lucide-react";
+import { format } from "date-fns";
+
+export default function ConversionHistory() {
+  const [playingAudio, setPlayingAudio] = useState<string | null>(null);
+  
+  const { data, isLoading } = useQuery({
+    queryKey: ['/api/conversion-history'],
+    queryFn: async () => {
+      try {
+        const response = await fetch('/api/conversion-history');
+        const data = await response.json();
+        console.log("Conversion history data:", data);
+        return data;
+      } catch (error) {
+        console.error("Error fetching conversion history:", error);
+        return { conversions: [] };
+      }
+    }
+  });
+  
+  const conversions = data?.conversions || [];
+  
+  const playAudio = (audioPath: string) => {
+    setPlayingAudio(audioPath);
+    const audio = new Audio(audioPath);
+    audio.onended = () => setPlayingAudio(null);
+    audio.play();
+  };
+  
+  const downloadAudio = (audioPath: string) => {
+    const a = document.createElement("a");
+    a.href = audioPath;
+    a.download = `voice-${Date.now()}.mp3`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
+  
+  const formatDate = (dateString: string | Date) => {
+    try {
+      return format(new Date(dateString), "MMM d, yyyy 'at' h:mm a");
+    } catch (error) {
+      return "Unknown date";
+    }
+  };
+  
+  return (
+    <Card className="bg-zinc-900 rounded-xl shadow-lg border-zinc-700 overflow-hidden mt-8">
+      <CardContent className="p-6">
+        <div className="flex items-center mb-4">
+          <Clock className="text-zinc-300 h-5 w-5 mr-2" />
+          <h2 className="text-xl font-semibold text-white">Conversion History</h2>
+        </div>
+        
+        {isLoading ? (
+          <div className="flex justify-center py-8">
+            <div className="flex space-x-2">
+              <div className="animate-pulse rounded-full bg-zinc-500 h-3 w-3"></div>
+              <div className="animate-pulse rounded-full bg-zinc-400 h-3 w-3"></div>
+              <div className="animate-pulse rounded-full bg-zinc-300 h-3 w-3"></div>
+            </div>
+          </div>
+        ) : !Array.isArray(conversions) || conversions.length === 0 ? (
+          <div className="text-center py-8 text-zinc-400">
+            No conversion history yet. Convert some text to see your history here.
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {conversions.map((conversion: any) => (
+              <div 
+                key={conversion.id}
+                className={`p-4 rounded-lg border ${playingAudio === conversion.audioPath ? 'border-zinc-500 bg-zinc-800' : 'border-zinc-700 bg-zinc-900'}`}
+              >
+                <div className="flex justify-between mb-2">
+                  <h3 className="font-medium text-white">{conversion.voiceName || "Unknown voice"}</h3>
+                  <span className="text-xs text-zinc-400">{formatDate(conversion.createdAt)}</span>
+                </div>
+                <p className="text-zinc-300 mb-3 text-sm line-clamp-2">
+                  {conversion.text}
+                </p>
+                <div className="flex space-x-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="text-xs py-1 h-8 border-zinc-700 text-zinc-300 bg-transparent hover:bg-zinc-800"
+                    onClick={() => playAudio(conversion.audioPath)}
+                  >
+                    <Play className="h-3.5 w-3.5 mr-1" />
+                    {playingAudio === conversion.audioPath ? 'Playing...' : 'Play'}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="text-xs py-1 h-8 border-zinc-700 text-zinc-300 bg-transparent hover:bg-zinc-800"
+                    onClick={() => downloadAudio(conversion.audioPath)}
+                  >
+                    <Download className="h-3.5 w-3.5 mr-1" />
+                    Download
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+```
+
+## Instructions Card Component (client/src/components/InstructionsCard.tsx)
+
+```tsx
+import {
+  Card,
+  CardContent,
+} from "@/components/ui/card";
+import { FileAudio, Download, VolumeX, Volume2, Users } from "lucide-react";
+
+export default function InstructionsCard() {
+  return (
+    <Card className="rounded-xl shadow-lg overflow-hidden bg-zinc-900 border-zinc-700 mt-8">
+      <CardContent className="p-6">
+        <h2 className="text-xl font-semibold text-white mb-4 flex items-center">
+          <FileAudio className="text-zinc-300 h-5 w-5 mr-2" />
+          How It Works
+        </h2>
+        
+        <div className="space-y-4">
+          <div className="p-3 rounded-lg bg-zinc-800 border border-zinc-700">
+            <h3 className="font-medium text-white mb-1 flex items-center">
+              <Users className="h-4 w-4 mr-2 text-zinc-400" />
+              Choose a Voice
+            </h3>
+            <p className="text-zinc-300 text-sm">
+              Select from a range of realistic voices with different accents and styles. Preview voices before converting your text.
+            </p>
+          </div>
+          
+          <div className="p-3 rounded-lg bg-zinc-800 border border-zinc-700">
+            <h3 className="font-medium text-white mb-1 flex items-center">
+              <Volume2 className="h-4 w-4 mr-2 text-zinc-400" />
+              Enter Your Text
+            </h3>
+            <p className="text-zinc-300 text-sm">
+              Type or paste the text you want to convert to speech. For best results, ensure proper punctuation.
+            </p>
+          </div>
+          
+          <div className="p-3 rounded-lg bg-zinc-800 border border-zinc-700">
+            <h3 className="font-medium text-white mb-1 flex items-center">
+              <VolumeX className="h-4 w-4 mr-2 text-zinc-400" />
+              Customize Speech
+            </h3>
+            <p className="text-zinc-300 text-sm">
+              Our advanced AI technology delivers natural-sounding speech with proper intonation and emphasis.
+            </p>
+          </div>
+          
+          <div className="p-3 rounded-lg bg-zinc-800 border border-zinc-700">
+            <h3 className="font-medium text-white mb-1 flex items-center">
+              <Download className="h-4 w-4 mr-2 text-zinc-400" />
+              Download Your Audio
+            </h3>
+            <p className="text-zinc-300 text-sm">
+              Once generated, you can play the audio directly in the browser or download it as an MP3 file for offline use.
+            </p>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+```
+
+## Server Entry Point (server/index.ts)
+
+```typescript
+import express, { NextFunction, Request, Response } from "express";
+import { registerRoutes } from "./routes";
+import { log, setupVite, serveStatic } from "./vite";
+
+async function main() {
+  const app = express();
+  const isDev = process.env.NODE_ENV === "development";
+
+  // Parse JSON body
+  app.use(express.json());
+
+  // Register routes
+  const httpServer = await registerRoutes(app);
+
+  // Handle errors
+  app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+    console.error(err);
+    res.status(500).json({
+      message: err.message || "Internal server error",
+    });
+  });
+
+  // Setup Vite dev server in development
+  if (isDev) {
+    setupVite(app, httpServer);
+  } else {
+    serveStatic(app);
+  }
+
+  // Start server
+  const port = process.env.PORT || 5000;
+  httpServer.listen(port, () => {
+    log(`serving on port ${port}`);
+  });
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+```
+
+## Dependencies (package.json)
+
+```json
+{
+  "name": "voice-forge",
+  "version": "1.0.0",
+  "description": "Text-to-speech application using ElevenLabs API",
+  "main": "server/index.ts",
+  "scripts": {
+    "dev": "NODE_ENV=development tsx server/index.ts",
+    "build": "NODE_ENV=production vite build --config=vite.config.ts",
+    "start": "NODE_ENV=production node dist/server.js",
+    "db:push": "drizzle-kit push"
+  },
+  "dependencies": {
+    "@hookform/resolvers": "^3.3.4",
+    "@neondatabase/serverless": "^0.9.0",
+    "@radix-ui/react-dialog": "^1.0.5",
+    "@radix-ui/react-label": "^2.0.2",
+    "@radix-ui/react-select": "^2.0.0",
+    "@radix-ui/react-slot": "^1.0.2",
+    "@tanstack/react-query": "^5.20.5",
+    "axios": "^1.6.7",
+    "class-variance-authority": "^0.7.0",
+    "clsx": "^2.1.0",
+    "date-fns": "^3.3.1",
+    "drizzle-orm": "^0.30.1",
+    "drizzle-zod": "^0.6.1",
+    "express": "^4.18.2",
+    "lucide-react": "^0.338.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-hook-form": "^7.50.1",
+    "tailwind-merge": "^2.2.1",
+    "tailwindcss-animate": "^1.0.7",
+    "wouter": "^3.0.0",
+    "ws": "^8.16.0",
+    "zod": "^3.22.4",
+    "zod-validation-error": "^3.0.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/typography": "^0.5.10",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.11.19",
+    "@types/react": "^18.2.55",
+    "@types/react-dom": "^18.2.19",
+    "@types/ws": "^8.5.10",
+    "@vitejs/plugin-react": "^4.2.1",
+    "autoprefixer": "^10.4.17",
+    "drizzle-kit": "^0.20.14",
+    "postcss": "^8.4.35",
+    "tailwindcss": "^3.4.1",
+    "tsx": "^4.7.1",
+    "typescript": "^5.3.3",
+    "vite": "^5.1.2"
+  }
+}
+```
+
+## Setup Instructions
+
+1. **Clone this repository to your GitHub**
+
+2. **Install dependencies**
+   ```
+   npm install
+   ```
+
+3. **Set up environment variables**
+   Create a `.env` file with the following:
+   ```
+   DATABASE_URL=your_postgresql_database_url
+   ELEVENLABS_API_KEY=your_elevenlabs_api_key
+   ```
+
+4. **Set up the database**
+   ```
+   npm run db:push
+   ```
+
+5. **Start the development server**
+   ```
+   npm run dev
+   ```
+
+## Features
+
+- Text-to-speech conversion using ElevenLabs API
+- Multiple voice options including custom voices
+- Audio preview before conversion
+- MP3 download capability
+- Conversion history tracking
+- Dark/black theme design
+- Responsive layout for all devices
+
+## Deployment
+
+You can host this application on GitHub Pages, Netlify, Vercel, or any platform that supports Node.js applications. Make sure to set up the necessary environment variables for the ElevenLabs API key and database connection.
